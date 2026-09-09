@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# WordPress lab manager for this Docker/Caddy server.
+# Install as /usr/local/bin/glom-wp.
+
+set -Eeuo pipefail
+
+SITES_DIR=/opt/sites
+CADDY_DIR=/opt/caddy
+DEFAULT_SOURCE=template
+
+die() { echo "Error: $*" >&2; exit 1; }
+red() { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+
+ensure_writable_dir() {
+  local path=$1
+  local group
+  group=$(id -gn)
+  if [[ ! -d "$path" ]]; then
+    echo "Preparing $path…"
+    sudo install -d -m 750 -o "$USER" -g "$group" "$path" || die "Could not create $path"
+  elif [[ ! -w "$path" ]]; then
+    echo "Preparing write access to $path…"
+    sudo chown "$USER:$group" "$path" || die "Could not make $path writable"
+  fi
+  [[ -w "$path" ]] || die "$path is not writable"
+}
+
+ensure_writable_file() {
+  local path=$1
+  local group
+  group=$(id -gn)
+  [[ -f "$path" ]] || die "Required file does not exist: $path"
+  if [[ ! -w "$path" ]]; then
+    echo "Preparing write access to $path…"
+    sudo chown "$USER:$group" "$path" || die "Could not make $path writable"
+  fi
+  [[ -w "$path" ]] || die "$path is not writable"
+}
+
+reload_caddy() {
+  local formatted
+  formatted=$(mktemp "$CADDY_DIR/Caddyfile.formatted.XXXXXX")
+  # `caddy fmt` intentionally exits 1 when it made formatting changes.
+  docker compose -f "$CADDY_DIR/compose.yml" exec -T caddy \
+    caddy fmt /etc/caddy/Caddyfile > "$formatted" 2>/dev/null || true
+  if [[ ! -s "$formatted" ]]; then
+    rm -f "$formatted"
+    die 'Caddy could not format its configuration'
+  fi
+  # Write in place: the Caddy container bind-mounts this exact file inode.
+  cat "$formatted" > "$CADDY_DIR/Caddyfile"
+  rm -f "$formatted"
+  docker compose -f "$CADDY_DIR/compose.yml" exec -T caddy \
+    caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  glom-wp new --domain DOMAIN [--from SOURCE] [--name NAME] [--title TITLE]
+  glom-wp list
+  glom-wp destroy --name NAME
+  glom-wp --help
+
+Commands:
+  new    Create an isolated WordPress site by cloning an existing site.
+  list   List running WordPress sites, their domain, and creation time.
+  destroy Permanently remove one WordPress site and all of its Docker resources.
+
+new options:
+  --domain DOMAIN   Required. The public hostname for the site. Its DNS A record
+                    must already point to this VPS.
+  --from SOURCE     Optional. Name of the existing site/container stack to clone.
+                    Default: template.
+  --name NAME       Optional. Name for the new Docker stack and /opt/sites folder.
+                    Default: first part of DOMAIN (e.g. demo from demo.glomllc.com).
+  --title TITLE     Optional. WordPress site title shown to visitors and in the
+                    admin. Default: the resolved NAME value.
+  -h, --help        Show this help text.
+
+destroy options:
+  --name NAME       Required. The site/stack name to permanently destroy.
+  -h, --help        Show this help text.
+
+Examples:
+  glom-wp new --domain template.glomllc.com --from fpf --name template
+  glom-wp new --domain ai-test-01.glomllc.com
+  glom-wp list
+  glom-wp destroy --name ai-test-01
+
+Before creating a site, the command asks you to confirm that its DNS record is
+configured. It then verifies DNS, copies WordPress files and database data,
+rewrites URLs safely (including Elementor data), and adds HTTPS routing in Caddy.
+Destroying a site requires you to type its exact name a second time.
+EOF
+}
+
+list_sites() {
+  printf '%-24s %-38s %s\n' 'NAME' 'DOMAIN' 'CREATED (UTC)'
+  printf '%-24s %-38s %s\n' '----' '------' '-------------'
+  local dir name domain container created found=0
+  for dir in "$SITES_DIR"/*; do
+    [[ -d "$dir" && -f "$dir/compose.yml" ]] || continue
+    name=$(basename "$dir")
+    container=$(docker compose -f "$dir/compose.yml" ps -q --status running wordpress 2>/dev/null || true)
+    [[ -n "$container" ]] || continue
+    domain=$(domain_for_site "$name" || true)
+    created=$(docker inspect -f '{{.Created}}' "$container" 2>/dev/null | sed 's/\.[0-9]*Z$/Z/' || true)
+    printf '%-24s %-38s %s\n' "$name" "${domain:-unknown}" "${created:-unknown}"
+    found=1
+  done
+  [[ "$found" -eq 1 ]] || echo 'No running WordPress sites found.'
+}
+
+new_site() {
+  local name='' domain='' source=$DEFAULT_SOURCE title=''
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --domain) [[ $# -ge 2 ]] || die '--domain needs a hostname'; domain=$2; shift 2 ;;
+      --from) [[ $# -ge 2 ]] || die '--from needs a site/container name'; source=$2; shift 2 ;;
+      --name) [[ $# -ge 2 ]] || die '--name needs a site name'; name=$2; shift 2 ;;
+      --title) [[ $# -ge 2 ]] || die '--title needs a site title'; title=$2; shift 2 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+
+  [[ -n "$domain" ]] || { usage; return 1; }
+  [[ -n "$name" ]] || name=${domain%%.*}
+  [[ -n "$title" ]] || title=$name
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "Invalid site name: $name"
+  [[ "$source" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "Invalid source name: $source"
+  [[ "$domain" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "Invalid domain: $domain"
+  [[ "$name" != "$source" ]] || die 'New site and source must differ'
+
+  local source_dir="$SITES_DIR/$source"
+  local target_dir="$SITES_DIR/$name"
+  local source_env="$source_dir/.env"
+  local source_compose="$source_dir/compose.yml"
+  local target_env="$target_dir/.env"
+  local target_compose="$target_dir/compose.yml"
+  local source_wp_volume="${source}_wordpress_data"
+  local target_wp_volume="${name}_wordpress_data"
+  local caddyfile="$CADDY_DIR/Caddyfile"
+  local caddy_compose="$CADDY_DIR/compose.yml"
+
+  command -v docker >/dev/null || die 'Docker is not available'
+  ensure_writable_dir "$SITES_DIR"
+  ensure_writable_dir "$CADDY_DIR"
+  [[ -f "$source_env" && -f "$source_compose" ]] || die "Source '$source' does not exist"
+  [[ ! -e "$target_dir" ]] || die "Target directory already exists: $target_dir"
+  [[ -f "$caddyfile" && -f "$caddy_compose" ]] || die 'Caddy setup not found'
+  ensure_writable_file "$caddyfile"
+  docker volume inspect "$source_wp_volume" >/dev/null 2>&1 || die 'Source WordPress volume missing'
+  docker network inspect caddy_network >/dev/null 2>&1 || die 'Shared caddy_network missing'
+  grep -Fq "$domain {" "$caddyfile" && die "$domain already exists in Caddy"
+
+  echo
+  echo "Before continuing, configure this DNS A record in your DNS manager:"
+  echo "  $domain  ->  this VPS public IP"
+  read -r -p "Is the DNS record configured and ready to validate? [y/N] " dns_confirm
+  case "$dns_confirm" in
+    y|Y|yes|YES|Yes) ;;
+    *) echo 'Cancelled. Configure DNS, then run the same command again.'; return 0 ;;
+  esac
+  getent ahostsv4 "$domain" >/dev/null 2>&1 || die "DNS for $domain does not resolve yet"
+
+  set -a
+  # shellcheck disable=SC1090
+  source "$source_env"
+  set +a
+  local source_root_password=$MARIADB_ROOT_PASSWORD
+  unset MARIADB_ROOT_PASSWORD WORDPRESS_DB_PASSWORD
+
+  local source_url
+  source_url=$(docker compose -f "$source_compose" --env-file "$source_env" exec -T db \
+    mariadb -u root -p"$source_root_password" "$source" -Nse \
+    "SELECT option_value FROM wp_options WHERE option_name = 'home' LIMIT 1")
+  [[ "$source_url" =~ ^https?:// ]] || die 'Could not read the source URL'
+  local target_url="https://$domain"
+
+  echo "Creating $name from $source ($source_url -> $target_url)…"
+  mkdir -p "$target_dir"
+  umask 077
+  local wordpress_db_password mariadb_root_password
+  wordpress_db_password=$(openssl rand -hex 32)
+  mariadb_root_password=$(openssl rand -hex 32)
+  cat > "$target_env" <<EOF
+WORDPRESS_DB_PASSWORD=$wordpress_db_password
+MARIADB_ROOT_PASSWORD=$mariadb_root_password
+EOF
+  chmod 600 "$target_env"
+
+  cat > "$target_compose" <<'YAML'
+services:
+  wordpress:
+    image: wordpress:php8.3-apache
+    restart: unless-stopped
+    environment:
+      WORDPRESS_DB_HOST: db:3306
+      WORDPRESS_DB_NAME: __DATABASE_NAME__
+      WORDPRESS_DB_USER: __DATABASE_NAME__
+      WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD}
+      WORDPRESS_CONFIG_EXTRA: |
+        if (isset($$_SERVER['HTTP_X_FORWARDED_PROTO']) && $$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+          $$_SERVER['HTTPS'] = 'on';
+        }
+    volumes:
+      - wordpress_data:/var/www/html
+    networks:
+      caddy_network:
+        aliases:
+          - __WORDPRESS_ALIAS__
+      backend:
+  db:
+    image: mariadb:11.4
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: __DATABASE_NAME__
+      MARIADB_USER: __DATABASE_NAME__
+      MARIADB_PASSWORD: ${WORDPRESS_DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+    volumes:
+      - db_data:/var/lib/mysql
+    networks:
+      - backend
+volumes:
+  wordpress_data:
+  db_data:
+networks:
+  caddy_network:
+    external: true
+  backend:
+    internal: true
+YAML
+  sed -i "s/__DATABASE_NAME__/$name/g; s/__WORDPRESS_ALIAS__/${name}-wordpress/g" "$target_compose"
+
+  # Create all named volumes with Docker Compose labels before copying files.
+  docker compose -f "$target_compose" --env-file "$target_env" create
+  docker compose -f "$target_compose" --env-file "$target_env" up -d db
+  echo 'Waiting for the target database…'
+  local ready=0
+  for _ in $(seq 1 60); do
+    if docker compose -f "$target_compose" --env-file "$target_env" exec -T db mariadb-admin -u root -p"$mariadb_root_password" ping --silent >/dev/null 2>&1; then ready=1; break; fi
+    sleep 1
+  done
+  [[ "$ready" -eq 1 ]] || die 'Target database did not become ready'
+
+  echo 'Copying WordPress files…'
+  docker run --rm -v "$source_wp_volume:/from:ro" -v "$target_wp_volume:/to" alpine:3.20 sh -c 'cd /from && tar cpf - . | tar xpf - -C /to'
+
+  echo 'Copying database…'
+  docker compose -f "$source_compose" --env-file "$source_env" exec -T db mariadb-dump -u root -p"$source_root_password" --single-transaction --routines --triggers "$source" \
+    | docker compose -f "$target_compose" --env-file "$target_env" exec -T db mariadb -u root -p"$mariadb_root_password" "$name"
+
+  docker compose -f "$target_compose" --env-file "$target_env" exec -T db mariadb -u root -p"$mariadb_root_password" "$name" -e \
+    "UPDATE wp_options SET option_value = '$target_url' WHERE option_name IN ('home', 'siteurl');"
+  docker compose -f "$target_compose" --env-file "$target_env" up -d
+
+  echo 'Rewriting URLs in WordPress and Elementor data…'
+  docker run --rm --network "${name}_backend" --volumes-from "${name}-wordpress-1" \
+    -e WORDPRESS_DB_HOST=db:3306 -e WORDPRESS_DB_NAME="$name" -e WORDPRESS_DB_USER="$name" -e WORDPRESS_DB_PASSWORD="$wordpress_db_password" \
+    wordpress:cli-php8.3 wp --path=/var/www/html search-replace "$source_url" "$target_url" --all-tables --precise --skip-columns=guid --skip-plugins --skip-themes --allow-root --quiet
+
+  echo 'Setting the WordPress site title…'
+  docker run --rm --network "${name}_backend" --volumes-from "${name}-wordpress-1" \
+    -e WORDPRESS_DB_HOST=db:3306 -e WORDPRESS_DB_NAME="$name" -e WORDPRESS_DB_USER="$name" -e WORDPRESS_DB_PASSWORD="$wordpress_db_password" \
+    wordpress:cli-php8.3 wp --path=/var/www/html option update blogname "$title" --allow-root --quiet
+
+  cat > "$target_dir/.glom-wp-site" <<EOF
+NAME=$name
+DOMAIN=$domain
+SOURCE=$source
+CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+
+  cat >> "$caddyfile" <<EOF
+
+$domain {
+  encode zstd gzip
+  reverse_proxy ${name}-wordpress:80
+}
+EOF
+  echo 'Adding HTTPS routing in Caddy…'
+  reload_caddy
+
+  echo
+  echo "Done: $target_url"
+  echo "It has the same WordPress accounts as '$source'; create per-site accounts as needed."
+}
+
+domain_for_site() {
+  local name=$1
+  local metadata="$SITES_DIR/$name/.glom-wp-site"
+  if [[ -f "$metadata" ]]; then
+    local stored_domain
+    stored_domain=$(awk -F= '$1 == "DOMAIN" { print substr($0, 8); exit }' "$metadata")
+    [[ -n "$stored_domain" ]] && { printf '%s\n' "$stored_domain"; return 0; }
+  fi
+  # Compatibility for sites created before glom-wp began storing metadata.
+  awk -v backend="reverse_proxy ${name}-wordpress:80" '
+    /^[^[:space:]#][^{}]*[[:space:]]\{$/ { header=$0 }
+    index($0, backend) { sub(/[[:space:]]*\{.*/, "", header); print header; exit }
+  ' "$CADDY_DIR/Caddyfile"
+}
+
+remove_caddy_site() {
+  local name=$1
+  local domain=$2
+  local caddyfile="$CADDY_DIR/Caddyfile"
+  local temporary backup
+  temporary=$(mktemp "$CADDY_DIR/Caddyfile.XXXXXX")
+  backup=$(mktemp "$CADDY_DIR/Caddyfile.backup.XXXXXX")
+  cp "$caddyfile" "$backup"
+  awk -v header="$domain {" '
+    $0 == header { skipping=1; next }
+    skipping && $0 == "}" { skipping=0; next }
+    !skipping { print }
+  ' "$caddyfile" > "$temporary"
+  # Do not use mv here; Caddy bind-mounts the existing Caddyfile inode.
+  cat "$temporary" > "$caddyfile"
+  rm -f "$temporary"
+  if ! reload_caddy; then
+    cat "$backup" > "$caddyfile"
+    reload_caddy || true
+    die 'Caddy reload failed; its previous configuration was restored'
+  fi
+  rm -f "$backup"
+}
+
+destroy_site() {
+  local name=''
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) [[ $# -ge 2 ]] || die '--name needs a site name'; name=$2; shift 2 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$name" ]] || { usage; return 1; }
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "Invalid site name: $name"
+
+  local site_dir="$SITES_DIR/$name"
+  local compose="$site_dir/compose.yml"
+  local environment="$site_dir/.env"
+  [[ -f "$compose" && -f "$environment" ]] || die "Site '$name' does not exist"
+
+  ensure_writable_dir "$SITES_DIR"
+  ensure_writable_dir "$CADDY_DIR"
+  ensure_writable_file "$CADDY_DIR/Caddyfile"
+
+  local domain
+  domain=$(domain_for_site "$name")
+  [[ -n "$domain" ]] || die "Could not determine the Caddy domain for '$name'; nothing was deleted"
+
+  echo
+  red "WARNING: This permanently deletes '$name': its WordPress files, database, Docker containers, volumes, and Caddy route."
+  read -r -p "Type the exact site name ($name) to permanently destroy it: " confirmation
+  [[ "$confirmation" == "$name" ]] || { echo 'Cancelled. Nothing was deleted.'; return 0; }
+
+  echo "Destroying $name…"
+  docker compose -f "$compose" --env-file "$environment" down --volumes --remove-orphans || true
+  docker volume rm "${name}_wordpress_data" "${name}_db_data" >/dev/null 2>&1 || true
+  docker network rm "${name}_backend" >/dev/null 2>&1 || true
+  remove_caddy_site "$name" "$domain"
+  sudo rm -rf -- "$site_dir"
+  green "Destroyed '$name' successfully. Remove the DNS record for $domain from your DNS manager (for example, Namecheap)."
+}
+
+case "${1:-}" in
+  new) shift; new_site "$@" ;;
+  list) shift; [[ $# -eq 0 ]] || die 'glom-wp list takes no options'; list_sites ;;
+  destroy) shift; destroy_site "$@" ;;
+  help|--help|-h|'') usage ;;
+  *) die "Unknown command: $1 (try: glom-wp --help)" ;;
+esac
