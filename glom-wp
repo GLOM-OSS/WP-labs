@@ -216,6 +216,8 @@ services:
   db:
     image: mariadb:11.4
     restart: unless-stopped
+    command: --innodb-buffer-pool-size=192M --performance-schema=OFF
+    mem_limit: 512m
     environment:
       MARIADB_DATABASE: __DATABASE_NAME__
       MARIADB_USER: __DATABASE_NAME__
