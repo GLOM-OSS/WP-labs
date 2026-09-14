@@ -373,6 +373,7 @@ destroy_site() {
   remove_caddy_site "$name" "$domain"
   sudo sed -i "/^${name}\$/d" /etc/glom/agent-stacks.allow 2>/dev/null || true
   sudo rm -rf "/opt/automation/snapshots/$name"
+  sudo rm -rf "/opt/automation/qa/artifacts/$name"
   sudo rm -rf -- "$site_dir"
   green "Destroyed '$name' successfully. Remove the DNS record for $domain from your DNS manager (for example, Namecheap)."
 }
