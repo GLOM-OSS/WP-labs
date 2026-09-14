@@ -287,6 +287,11 @@ EOF
   echo 'Adding HTTPS routing in Caddy…'
   reload_caddy
 
+  if [[ "$name" != "template" ]] && ! grep -qxF "$name" /etc/glom/agent-stacks.allow 2>/dev/null; then
+    echo "$name" | sudo tee -a /etc/glom/agent-stacks.allow >/dev/null
+    echo "Added '$name' to the automation allowlist."
+  fi
+
   echo
   echo "Done: $target_url"
   echo "It has the same WordPress accounts as '$source'; create per-site accounts as needed."
@@ -366,6 +371,7 @@ destroy_site() {
   docker volume rm "${name}_wordpress_data" "${name}_db_data" >/dev/null 2>&1 || true
   docker network rm "${name}_backend" >/dev/null 2>&1 || true
   remove_caddy_site "$name" "$domain"
+  sudo sed -i "/^${name}\$/d" /etc/glom/agent-stacks.allow 2>/dev/null || true
   sudo rm -rf -- "$site_dir"
   green "Destroyed '$name' successfully. Remove the DNS record for $domain from your DNS manager (for example, Namecheap)."
 }
