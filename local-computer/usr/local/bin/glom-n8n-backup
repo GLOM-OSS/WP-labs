@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SSH_HOST="glom"
+BACKUP_DIR="$HOME/projects/GLOM/wp-automation"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+DEST="$BACKUP_DIR/n8n-${TIMESTAMP}.sql.gz"
+
+echo "Checking n8n-db is reachable and healthy on ${SSH_HOST}..."
+STATUS="$(ssh "$SSH_HOST" 'docker inspect -f "{{.State.Health.Status}}" n8n-db' 2>/dev/null || echo "unreachable")"
+if [[ "$STATUS" != "healthy" ]]; then
+  echo "glom-n8n-backup: n8n-db is not healthy (status: ${STATUS}). Aborting." >&2
+  exit 1
+fi
+
+mkdir -p "$BACKUP_DIR"
+
+echo "Dumping n8n database from ${SSH_HOST}..."
+ssh "$SSH_HOST" 'docker exec n8n-db pg_dump -U n8n n8n' | gzip > "$DEST"
+
+SIZE="$(wc -c < "$DEST" | tr -d ' ')"
+if [[ "$SIZE" -lt 1000 ]]; then
+  echo "glom-n8n-backup: resulting file is suspiciously small (${SIZE} bytes) — something likely failed. Removing it." >&2
+  rm -f "$DEST"
+  exit 1
+fi
+
+echo "Backup saved: $DEST ($(du -h "$DEST" | cut -f1))"
