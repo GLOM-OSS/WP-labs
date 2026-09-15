@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ALLOWLIST=/etc/glom/agent-stacks.allow
+SNAPDIR=/opt/automation/snapshots
+SITES_DIR=/opt/sites
+
+die() { echo "glom-agent: $*" >&2; exit 1; }
+
+check_stack() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "invalid stack name"
+  grep -qxF "$1" "$ALLOWLIST" || die "stack '$1' is not in the allowlist"
+}
+
+# Resolve containers by compose labels. Confirm the service names on your
+# stacks with: docker inspect <container> --format '{{json .Config.Labels}}'
+container() { # <stack> <service>
+  local id
+  id=$(docker ps -q \
+        --filter "label=com.docker.compose.project=$1" \
+        --filter "label=com.docker.compose.service=$2" | head -n1)
+  [[ -n "$id" ]] || die "no running '$2' container for stack '$1'"
+  echo "$id"
+}
+
+dumpcmd() { # mariadb-dump on newer images, mysqldump on older ones
+  docker exec "$1" sh -c 'command -v mariadb-dump >/dev/null && echo mariadb-dump || echo mysqldump'
+}
+clientcmd() {
+  docker exec "$1" sh -c 'command -v mariadb >/dev/null && echo mariadb || echo mysql'
+}
+
+# Runs a wp-cli command via a throwaway wordpress:cli-php8.3 container,
+# matching glom-wp's own pattern -- the site's apache image has no wp-cli.
+wpcli() { # <stack> <wordpress-container-id> [wp-cli args...]
+  local stack=$1 wpc=$2; shift 2
+  local db_password
+  db_password=$(grep '^WORDPRESS_DB_PASSWORD=' "$SITES_DIR/$stack/.env" | cut -d= -f2-)
+  [[ -n "$db_password" ]] || die "could not read DB password for '$stack'"
+  docker run --rm --network "${stack}_backend" --volumes-from "$wpc" \
+    -e WORDPRESS_DB_HOST=db:3306 -e WORDPRESS_DB_NAME="$stack" \
+    -e WORDPRESS_DB_USER="$stack" -e WORDPRESS_DB_PASSWORD="$db_password" \
+    wordpress:cli-php8.3 wp --path=/var/www/html --allow-root "$@"
+}
+
+cmd=${1:-}; shift || true
+
+case "$cmd" in
+  wp)
+    stack=${1:-}; shift || true
+    check_stack "$stack"
+    wpc=$(container "$stack" wordpress)
+    wpcli "$stack" "$wpc" "$@"
+    ;;
+
+  snapshot)
+    stack=${1:-}; label=${2:-auto}
+    check_stack "$stack"
+    [[ "$label" =~ ^(auto|milestone)$ ]] || die "label must be auto or milestone"
+    id="${label}-$(date +%Y%m%d-%H%M%S)"
+    dest="$SNAPDIR/$stack/$id"
+    mkdir -p "$dest"
+    db=$(container "$stack" db) || db=$(container "$stack" mariadb)
+    wpc=$(container "$stack" wordpress)
+    docker exec "$db" sh -c \
+      "exec $(dumpcmd "$db") --single-transaction --quick -u\"\$MARIADB_USER\" -p\"\$MARIADB_PASSWORD\" \"\$MARIADB_DATABASE\"" \
+      | gzip > "$dest/db.sql.gz"
+    docker exec "$wpc" tar -czf - -C /var/www/html wp-content > "$dest/wp-content.tar.gz"
+    echo "$id"
+    ;;
+
+  restore)
+    stack=${1:-}; id=${2:-}
+    check_stack "$stack"
+    [[ "$id" =~ ^(auto|milestone)-[0-9]{8}-[0-9]{6}$ ]] || die "invalid snapshot id"
+    src="$SNAPDIR/$stack/$id"
+    [[ -d "$src" ]] || die "no snapshot '$id' for stack '$stack'"
+    db=$(container "$stack" db) || db=$(container "$stack" mariadb)
+    wpc=$(container "$stack" wordpress)
+    gunzip -c "$src/db.sql.gz" | docker exec -i "$db" sh -c \
+      "exec $(clientcmd "$db") -u\"\$MARIADB_USER\" -p\"\$MARIADB_PASSWORD\" \"\$MARIADB_DATABASE\""
+    docker exec -i "$wpc" tar -xzf - --overwrite -C /var/www/html < "$src/wp-content.tar.gz"
+    wpcli "$stack" "$wpc" elementor flush-css || true
+    echo "restored $stack from $id"
+    ;;
+
+  snapshots)
+    stack=${1:-}
+    check_stack "$stack"
+    ls -1 "$SNAPDIR/$stack" 2>/dev/null || true
+    ;;
+
+  *)
+    die "usage: glom-agent {wp|snapshot|restore|snapshots} <stack> [args...]"
+    ;;
+esac
